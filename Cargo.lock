@@ -574,6 +574,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "c-api"
+version = "0.6.2"
+dependencies = [
+ "lix_sdk",
+ "tokio",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
