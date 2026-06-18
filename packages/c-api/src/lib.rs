@@ -1,10 +1,10 @@
 use std::{ffi::{CStr, CString, c_void}, os::raw::c_char, ptr::null, slice, time::Duration};
 
-use lix_sdk::{CreateBranchOptions, CreateBranchResult, FsBackend, InMemoryBackend, Lix, OpenLixOptions, open_lix, open_lix_with_backend};
+use lix_sdk::{CreateBranchOptions, CreateBranchResult, FsBackend, InMemoryBackend, Lix, OpenLixOptions, SqliteBackend, open_lix, open_lix_with_backend};
 use tokio::{runtime::{Builder, Runtime}, time::sleep};
 
 pub struct LixSession {
-    pub engine: Lix<FsBackend>,
+    pub engine: Lix<SqliteBackend>,
     pub runtime: Runtime
 }
 
@@ -45,11 +45,15 @@ pub extern "C" fn open(ptr: *mut LixOpenOptions) -> *mut LixSession {
 
     let lix = rt.block_on(async {
         let backend = match options.backend {
-            BackendType::Fs => {
-                // if options.data.is_null() need to handle errors
+            // BackendType::Fs => {
+            //     // if options.data.is_null() need to handle errors
+            //     let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
+            //     FsBackend::open(path).await.unwrap()
+            // },
+            _ => {
                 let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
-                FsBackend::open(path).await.unwrap()
-            },
+                SqliteBackend::open(path).unwrap()
+            }
             // BackendType::InMem => InMemoryBackend::new(),
         };
         return open_lix_with_backend(backend).await;
