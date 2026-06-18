@@ -14,7 +14,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-lix_sdk = { path = "../rs-sdk" }
+lix_sdk = { path = "../rs-sdk", features = ["sqlite"] }
 tokio = { version = "1", features = ["rt"] }
 
 [lints]

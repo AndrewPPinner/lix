@@ -1,11 +1,24 @@
-use std::{ffi::{CStr, CString, c_void}, os::raw::c_char, slice, time::Duration};
+use std::{ffi::{CStr, CString, c_void}, os::raw::c_char, ptr::null, slice, time::Duration};
 
-use lix_sdk::{CreateBranchOptions, CreateBranchResult, Lix, OpenLixOptions, open_lix};
+use lix_sdk::{CreateBranchOptions, CreateBranchResult, FsBackend, InMemoryBackend, Lix, OpenLixOptions, open_lix, open_lix_with_backend};
 use tokio::{runtime::{Builder, Runtime}, time::sleep};
 
 pub struct LixSession {
-    pub engine: Lix,
+    pub engine: Lix<FsBackend>,
     pub runtime: Runtime
+}
+
+#[repr(C)]
+pub struct LixOpenOptions {
+    pub backend: BackendType,
+    pub data: *mut u8,
+    pub data_len: usize
+}
+
+#[repr(C)]
+pub enum BackendType {
+    Fs = 1,
+    // InMem = 2
 }
 
 #[repr(C)]
@@ -26,9 +39,21 @@ pub extern "C" fn lix_version() -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn open() -> *mut LixSession {
+pub extern "C" fn open(ptr: *mut LixOpenOptions) -> *mut LixSession {
+    let options = (unsafe { ptr.as_mut() }).unwrap();
     let rt = Builder::new_multi_thread().enable_all().build().unwrap();
-    let lix = rt.block_on(open_lix(OpenLixOptions::default())).unwrap();
+
+    let lix = rt.block_on(async {
+        let backend = match options.backend {
+            BackendType::Fs => {
+                // if options.data.is_null() need to handle errors
+                let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
+                FsBackend::open(path).await.unwrap()
+            },
+            // BackendType::InMem => InMemoryBackend::new(),
+        };
+        return open_lix_with_backend(backend).await;
+    }).unwrap(); //FS backend takes minutes to spin up...
     return Box::into_raw(Box::new(LixSession { engine: lix, runtime: rt }));
 }
 
@@ -204,3 +229,8 @@ pub extern "C" fn create_branch(ptr: *mut LixSession, name_ptr: *const u8, name_
 
     return size;
 }
+
+// #[unsafe(no_mangle)]
+// pub extern "C" fn create_branch(ptr: *mut LixSession, name_ptr: *const u8, name_len: usize, out_buf: *mut u8, buf_len: usize) -> usize {
+//     let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return 0; };
+// }
