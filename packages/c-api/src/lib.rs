@@ -17,7 +17,7 @@ pub struct LixOpenOptions {
 
 #[repr(C)]
 pub enum BackendType {
-    Fs = 1,
+    Sqlite = 1,
     // InMem = 2
 }
 
@@ -50,7 +50,7 @@ pub extern "C" fn open(ptr: *mut LixOpenOptions) -> *mut LixSession {
             //     let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
             //     FsBackend::open(path).await.unwrap()
             // },
-            _ => {
+            BackendType::Sqlite => {
                 let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
                 SqliteBackend::open(path).unwrap()
             }
