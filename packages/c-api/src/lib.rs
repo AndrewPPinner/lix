@@ -1,240 +1,319 @@
-use std::{ffi::{CStr, CString, c_void}, os::raw::c_char, ptr::null, slice, time::Duration};
+use std::{slice, str};
+use tokio::runtime::{Builder, Runtime};
+use lix_sdk::{
+    Backend, CreateBranchOptions, InMemoryBackend, Lix, SqliteBackend, SwitchBranchOptions, open_lix_with_backend
+};
 
-use lix_sdk::{CreateBranchOptions, CreateBranchResult, FsBackend, InMemoryBackend, Lix, OpenLixOptions, SqliteBackend, open_lix, open_lix_with_backend};
-use tokio::{runtime::{Builder, Runtime}, time::sleep};
-
+#[repr(C)]
+#[expect(missing_debug_implementations)]
 pub struct LixSession {
-    pub engine: Lix<SqliteBackend>,
-    pub runtime: Runtime
+    inner: Box<dyn Session>,
+}
+
+struct LixSessionImpl<B> where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'a> B::Read<'a>: Send,
+    for<'a> B::Write<'a>: Send,
+{
+    engine: Lix<B>,
+    runtime: Runtime,
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct LixOpenOptions {
     pub backend: BackendType,
     pub data: *mut u8,
-    pub data_len: usize
+    pub data_len: usize,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub enum BackendType {
     Sqlite = 1,
-    // InMem = 2
+    InMem = 2
 }
 
-#[repr(C)]
-pub struct CResult<T> {
-    is_success: bool,
-    data: T
+trait Session: Send {
+    fn close(&mut self) -> bool;
+
+    fn get_active_branch(
+        &mut self, out_buf: *mut u8,
+        buf_len: usize) -> usize;
+
+    fn create_branch(
+        &mut self, name_ptr: *const u8, name_len: usize,
+        out_buf: *mut u8, buf_len: usize) -> usize;
+
+    fn change_branch(&mut self, branch_id_ptr: *const u8, branch_id_len: usize) -> bool;
 }
 
-#[repr(C)]
-pub struct CPtrResult<T> {
-    is_success: bool,
-    data: *mut T
+
+/// One implementation works for every backend.
+impl<B> Session for LixSessionImpl<B> where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'a> B::Read<'a>: Send,
+    for<'a> B::Write<'a>: Send,
+{
+    fn close(&mut self) -> bool {
+        return self.runtime
+            .block_on(self.engine.close())
+            .is_ok();
+    }
+
+    fn get_active_branch(&mut self, out_buf: *mut u8, buf_len: usize) -> usize {
+        if out_buf.is_null() {
+            return 0;
+        }
+
+        let Ok(branch_id) =
+            self.runtime.block_on(self.engine.active_branch_id())
+        else {
+            return 0;
+        };
+
+        let bytes = branch_id.as_bytes();
+
+        if bytes.len() > buf_len {
+            return 0;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                out_buf,
+                bytes.len(),
+            );
+        }
+
+        return bytes.len();
+    }
+
+
+    fn create_branch(&mut self, name_ptr: *const u8, name_len: usize, out_buf: *mut u8, buf_len: usize) -> usize {
+        if out_buf.is_null() {
+            return 0;
+        }
+
+        let Ok(name) = (unsafe {
+            str::from_utf8(
+                slice::from_raw_parts(name_ptr, name_len),
+            )
+        })
+        else {
+            return 0;
+        };
+
+
+        let Ok(receipt) = self.runtime.block_on(
+            self.engine.create_branch(CreateBranchOptions {
+                id: None,
+                name: name.to_owned(),
+                from_commit_id: None,
+            }),
+        )
+        else {
+            return 0;
+        };
+
+
+        let commit_id = receipt.commit_id.as_bytes();
+        let name = receipt.name.as_bytes();
+        let id = receipt.id.as_bytes();
+
+        let size =
+            commit_id.len() +
+            name.len() +
+            id.len() +
+            2;
+
+
+        if size > buf_len {
+            return 0;
+        }
+
+
+        unsafe {
+            let mut offset = 0;
+
+            std::ptr::copy_nonoverlapping(
+                commit_id.as_ptr(),
+                out_buf.add(offset),
+                commit_id.len(),
+            );
+
+            offset += commit_id.len();
+
+            *out_buf.add(offset) = b'|';
+            offset += 1;
+
+
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                out_buf.add(offset),
+                name.len(),
+            );
+
+            offset += name.len();
+
+            *out_buf.add(offset) = b'|';
+            offset += 1;
+
+
+            std::ptr::copy_nonoverlapping(
+                id.as_ptr(),
+                out_buf.add(offset),
+                id.len(),
+            );
+        }
+
+        return size;
+    }
+
+    fn change_branch(&mut self, branch_id_ptr: *const u8, branch_id_len: usize) -> bool {
+        let Ok(branch_id) = (unsafe {
+            str::from_utf8(
+                slice::from_raw_parts(branch_id_ptr, branch_id_len),
+            )
+        }) else { return false; };
+        let is_success = self.runtime.block_on(async {
+            return self.engine.switch_branch(SwitchBranchOptions{ branch_id: branch_id.to_owned() }).await.is_ok();
+        });
+        return is_success;
+    }
+
+    //Maybe a get branch info?
+}
+
+fn make_session<B>(backend: B) -> LixSession
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'a> B::Read<'a>: Send,
+    for<'a> B::Write<'a>: Send,
+{
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+
+    let engine = runtime
+        .block_on(open_lix_with_backend(backend))
+        .unwrap();
+
+
+    LixSession {
+        inner: Box::new(LixSessionImpl {
+            engine,
+            runtime,
+        }),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lix_version() -> u32 {
-    return 1;
+    1
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn open(ptr: *mut LixOpenOptions) -> *mut LixSession {
-    let options = (unsafe { ptr.as_mut() }).unwrap();
-    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
-
-    let lix = rt.block_on(async {
-        let backend = match options.backend {
-            // BackendType::Fs => {
-            //     // if options.data.is_null() need to handle errors
-            //     let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
-            //     FsBackend::open(path).await.unwrap()
-            // },
-            BackendType::Sqlite => {
-                let path = (unsafe { str::from_utf8(slice::from_raw_parts(options.data, options.data_len)) }).unwrap();
-                SqliteBackend::open(path).unwrap()
-            }
-            // BackendType::InMem => InMemoryBackend::new(),
-        };
-        return open_lix_with_backend(backend).await;
-    }).unwrap(); //FS backend takes minutes to spin up...
-    return Box::into_raw(Box::new(LixSession { engine: lix, runtime: rt }));
-}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn close(ptr: *mut LixSession) -> bool {
-    let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return false; };
-    let _ = wrapper.runtime.block_on(wrapper.engine.close());
-    drop(unsafe { Box::from_raw(wrapper) });
-    return true;
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn get_active_branch(ptr: *mut LixSession, out_buf: *mut u8, buf_len: usize) -> usize {
-    let Some(wrapper) = (unsafe { ptr.as_mut() }) else {
-        return 0;
-    };
-    if out_buf.is_null() { return 0; }
-    let Ok(branch_id) = wrapper.runtime.block_on(wrapper.engine.active_branch_id()) else {
-        return 0;
+pub extern "C" fn open(
+    ptr: *mut LixOpenOptions,
+) -> *mut LixSession {
+    let Some(options) = (unsafe { ptr.as_mut() }) else {
+        return std::ptr::null_mut();
     };
 
-    let bytes = branch_id.as_bytes();
-    if bytes.len() > buf_len {
-        return 0;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
-    }
 
-    return bytes.len();
+    let session = match options.backend {
+        BackendType::Sqlite => {
+            let Ok(path) = (unsafe {
+                str::from_utf8(
+                    slice::from_raw_parts(
+                        options.data,
+                        options.data_len,
+                    ),
+                )
+            })
+            else {
+                return std::ptr::null_mut();
+            };
+
+
+            let Ok(backend) = SqliteBackend::open(path) else {
+                return std::ptr::null_mut();
+            };
+
+
+            make_session(backend)
+        },
+        BackendType::InMem => {
+            make_session(InMemoryBackend::new())
+        }
+    };
+
+    Box::into_raw(Box::new(session))
 }
 
-#[repr(C)]
-pub struct Test1Value {
-    pub value1: u32,
-    pub value2: bool
+
+#[unsafe(no_mangle)]
+pub extern "C" fn close(ptr: *mut LixSession,) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+
+    let mut session = unsafe {
+        Box::from_raw(ptr)
+    };
+
+    let result = session.inner.close();
+    return result;
+}
+
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_active_branch(
+    ptr: *mut LixSession,
+    out_buf: *mut u8,
+    buf_len: usize,
+) -> usize {
+    let Some(session) = (unsafe { ptr.as_mut() }) else {
+        return 0;
+    };
+
+    return session.inner.get_active_branch(out_buf, buf_len);
+}
+
+
+#[unsafe(no_mangle)]
+pub extern "C" fn create_branch(
+    ptr: *mut LixSession,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_buf: *mut u8,
+    buf_len: usize,
+) -> usize {
+    let Some(session) = (unsafe { ptr.as_mut() }) else {
+        return 0;
+    };
+
+    return session.inner.create_branch(
+        name_ptr,
+        name_len,
+        out_buf,
+        buf_len,
+    );
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn Test1(ptr: *mut LixSession, out_buf: *mut u8, buf_len: usize, limit: usize) -> usize {
-    let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return 0; };
-    if out_buf.is_null() { return 0; }
-    let mut test_vec: Vec<Test1Value> = wrapper.runtime.block_on(async {
-        vec![
-            Test1Value{ value1: 69, value2: true },
-            Test1Value{ value1: 420, value2: false },
-        ]
-    });
-
-    let value_size = std::mem::size_of::<Test1Value>();
-    let actual_limit = std::cmp::min(test_vec.len(), limit);
-    let response_slice = &test_vec[..actual_limit];
-    let buffer_size_required = value_size * response_slice.len();
-
-    if buf_len < buffer_size_required {
-        return 0;
-    }
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            response_slice.as_ptr() as *const u8,
-            out_buf,
-            buffer_size_required
-        );
-    }
-
-    return buffer_size_required;
-}
-
-type CActionCompleteFn<T> = extern "C" fn(T, *mut c_void);
-type CActionCompletePtrFn<T> = extern "C" fn(*mut T);
-
-//Update to not be create branch and something that is !Send and async safe
-// #[unsafe(no_mangle)]
-// pub extern "C" fn create_branch(ptr: *mut LixSession, out_buf: *mut u8, buf_len: usize, context: *mut c_void, callback: CActionCompleteFn<usize>) -> bool {
-//     let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return false; };
-//     let session_addr = ptr as usize;
-//     let cb = callback;
-//     let ctx_addr = context as usize;
-
-//     wrapper.runtime.spawn(async move {
-//         let session = unsafe { &mut *(session_addr as *mut LixSession) };
-//         let ctx = unsafe { &mut *(ctx_addr as *mut c_void) };
-//         let reciept = session.engine.create_branch(CreateBranchOptions{ id: None, name: "Name".to_string(), from_commit_id: None }).await.unwrap();
-//         let commit_id = reciept.commit_id.as_bytes();
-//         let name = reciept.name.as_bytes();
-//         let id = reciept.id.as_bytes();
-//         let size = commit_id.len() + name.len() + id.len() + 2;
-
-//         if size > buf_len {
-//             cb(0, ctx);
-//             return;
-//         }
-
-//         unsafe {
-//             let mut offset = 0;
-//             std::ptr::copy_nonoverlapping(
-//                 commit_id.as_ptr(),
-//                 out_buf.add(offset),
-//                 commit_id.len()
-//             );
-//             *out_buf.add(offset) = b'|';
-//             offset += 1;
-
-//             std::ptr::copy_nonoverlapping(
-//                 name.as_ptr(),
-//                 out_buf,
-//                 name.len()
-//             );
-//             *out_buf.add(offset) = b'|';
-//             offset += 1;
-
-//             std::ptr::copy_nonoverlapping(
-//                 id.as_ptr(),
-//                 out_buf.add(offset),
-//                 id.len(),
-//             );
-//             offset += id.len();
-//         }
-
-//         cb(size, ctx);
-//     });
-
-//     return true;
-// }
-
-#[unsafe(no_mangle)]
-pub extern "C" fn create_branch(ptr: *mut LixSession, name_ptr: *const u8, name_len: usize, out_buf: *mut u8, buf_len: usize) -> usize {
-    let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return 0; };
-    if out_buf.is_null() { return 0; }
-    let Ok(name) = (unsafe { str::from_utf8(slice::from_raw_parts(name_ptr, name_len)) }) else {
-        return 0;
+pub extern "C" fn switch_branch(
+    ptr: *mut LixSession,
+    branch_id_ptr: *const u8,
+    branch_id_len: usize,
+) -> bool {
+    let Some(session) = (unsafe { ptr.as_mut() }) else {
+        return false;
     };
-    let Ok(reciept) = wrapper.runtime.block_on(wrapper.engine.create_branch(CreateBranchOptions{ id: None, name: name.to_owned(), from_commit_id: None })) else {
-        return 0;
-    };
-    let commit_id = reciept.commit_id.as_bytes();
-    let name = reciept.name.as_bytes();
-    let id = reciept.id.as_bytes();
-    let size = commit_id.len() + name.len() + id.len() + 2;
 
-    if size > buf_len {
-        return 0;
-    }
-
-    unsafe {
-        let mut offset = 0;
-        std::ptr::copy_nonoverlapping(
-            commit_id.as_ptr(),
-            out_buf.add(offset),
-            commit_id.len()
-        );
-        offset += commit_id.len();
-        *out_buf.add(offset) = b'|';
-        offset += 1;
-
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            out_buf.add(offset),
-            name.len()
-        );
-        offset += name.len();
-        *out_buf.add(offset) = b'|';
-        offset += 1;
-
-        std::ptr::copy_nonoverlapping(
-            id.as_ptr(),
-            out_buf.add(offset),
-            id.len(),
-        );
-        offset += id.len();
-    }
-
-    return size;
+    return session.inner.change_branch(branch_id_ptr, branch_id_len);
 }
-
-// #[unsafe(no_mangle)]
-// pub extern "C" fn create_branch(ptr: *mut LixSession, name_ptr: *const u8, name_len: usize, out_buf: *mut u8, buf_len: usize) -> usize {
-//     let Some(wrapper) = (unsafe { ptr.as_mut() }) else { return 0; };
-// }
