@@ -577,6 +577,7 @@ dependencies = [
 name = "c-api"
 version = "0.6.2"
 dependencies = [
+ "lix_cli",
  "lix_sdk",
  "tokio",
 ]

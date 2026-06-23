@@ -1,4 +1,4 @@
 language = "C"
 
 [export]
-include = ["Test1Value"]
+include = ["CQueryResultLayout", "CStringView", "CRowView"]

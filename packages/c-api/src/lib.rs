@@ -1,7 +1,7 @@
 use std::{slice, str};
 use tokio::runtime::{Builder, Runtime};
 use lix_sdk::{
-    Backend, CreateBranchOptions, InMemoryBackend, Lix, SqliteBackend, SwitchBranchOptions, open_lix_with_backend
+    Backend, CreateBranchOptions, ExecuteResult, InMemoryBackend, Lix, SqliteBackend, SwitchBranchOptions, Value, open_lix_with_backend
 };
 
 #[repr(C)]
@@ -34,6 +34,29 @@ pub enum BackendType {
     InMem = 2
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CStringView {
+    pub offset: u32,
+    pub len: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CRowView {
+    pub cells_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CQueryResultLayout {
+    pub columns_offset: u32,
+    pub rows_offset: u32,
+    pub column_count: u32,
+    pub row_count: u32,
+    pub rows_affected: u64,
+}
+
 trait Session: Send {
     fn close(&mut self) -> bool;
 
@@ -46,6 +69,8 @@ trait Session: Send {
         out_buf: *mut u8, buf_len: usize) -> usize;
 
     fn change_branch(&mut self, branch_id_ptr: *const u8, branch_id_len: usize) -> bool;
+
+    fn execute(&mut self, sql_ptr: *const u8, sql_len: usize, out_buf: *mut u8, buf_len: usize) -> usize;
 }
 
 
@@ -127,11 +152,9 @@ impl<B> Session for LixSessionImpl<B> where
             id.len() +
             2;
 
-
         if size > buf_len {
             return 0;
         }
-
 
         unsafe {
             let mut offset = 0;
@@ -147,7 +170,6 @@ impl<B> Session for LixSessionImpl<B> where
             *out_buf.add(offset) = b'|';
             offset += 1;
 
-
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
                 out_buf.add(offset),
@@ -158,7 +180,6 @@ impl<B> Session for LixSessionImpl<B> where
 
             *out_buf.add(offset) = b'|';
             offset += 1;
-
 
             std::ptr::copy_nonoverlapping(
                 id.as_ptr(),
@@ -182,7 +203,179 @@ impl<B> Session for LixSessionImpl<B> where
         return is_success;
     }
 
-    //Maybe a get branch info?
+    fn execute(&mut self, sql_ptr: *const u8, sql_len: usize, out_buf: *mut u8, buf_len: usize) -> usize {
+        let Ok(sql) = (unsafe {
+            str::from_utf8(
+                slice::from_raw_parts(sql_ptr, sql_len),
+            )
+        }) else { return 0; };
+
+        let results: ExecuteResult = self.runtime.block_on(
+            self.engine.execute(sql, &[])
+        ).unwrap();
+
+        let safe_out_buffer = unsafe { slice::from_raw_parts_mut(out_buf, buf_len) };
+        let total_bytes_written = serialize_to_buffer(&results, safe_out_buffer);
+
+        return total_bytes_written;
+    }
+}
+
+//Duplicated from cli>output
+fn value_to_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Boolean(v) => v.to_string(),
+        Value::Integer(v) => v.to_string(),
+        Value::Real(v) => v.to_string(),
+        Value::Text(v) => v.clone(),
+        Value::Json(v) => v.to_string(),
+        Value::Blob(bytes) => bytes_to_hex(bytes),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2 + 2);
+    out.push_str("0x");
+    for byte in bytes {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + (value - 10)) as char,
+        _ => '0',
+    }
+}
+
+//Needs fixed, has a bunch of corrupt data in it
+pub fn serialize_to_buffer(
+    results: &ExecuteResult,
+    out_buf: &mut [u8],
+) -> usize {
+    use std::mem::size_of;
+
+    let col_cnt = results.columns().len();
+    let row_cnt = results.rows().len();
+
+    let root_sz = size_of::<CQueryResultLayout>();
+    let cols_sz = size_of::<CStringView>() * col_cnt;
+    let rows_sz = size_of::<CRowView>() * row_cnt;
+    let cells_sz = size_of::<CStringView>() * col_cnt * row_cnt;
+
+    let root_offset = 0usize;
+    let cols_offset = root_offset + root_sz;
+    let rows_offset = cols_offset + cols_sz;
+    let cells_offset = rows_offset + rows_sz;
+    let string_pool_offset = cells_offset + cells_sz;
+
+    assert!(
+        out_buf.len() >= string_pool_offset,
+        "Buffer too small for metadata"
+    );
+
+    let (root_meta, remaining) = out_buf.split_at_mut(root_sz);
+    let (col_meta, remaining) = remaining.split_at_mut(cols_sz);
+    let (row_meta, remaining) = remaining.split_at_mut(rows_sz);
+    let (cell_meta, string_pool) = remaining.split_at_mut(cells_sz);
+
+    let root_slice = unsafe {
+        std::slice::from_raw_parts_mut(
+            root_meta.as_mut_ptr() as *mut CQueryResultLayout,
+            1,
+        )
+    };
+
+    let col_slice = unsafe {
+        std::slice::from_raw_parts_mut(
+            col_meta.as_mut_ptr() as *mut CStringView,
+            col_cnt,
+        )
+    };
+
+    let row_slice = unsafe {
+        std::slice::from_raw_parts_mut(
+            row_meta.as_mut_ptr() as *mut CRowView,
+            row_cnt,
+        )
+    };
+
+    let cell_slice = unsafe {
+        std::slice::from_raw_parts_mut(
+            cell_meta.as_mut_ptr() as *mut CStringView,
+            col_cnt * row_cnt,
+        )
+    };
+
+    let mut string_cursor = 0usize;
+
+    let write_string = |s: &str,
+                        pool: &mut [u8],
+                        cursor: &mut usize|
+     -> CStringView {
+        let start = *cursor;
+        let end = start + s.len();
+
+        assert!(
+            end <= pool.len(),
+            "Buffer too small for string pool"
+        );
+
+        pool[start..end].copy_from_slice(s.as_bytes());
+        *cursor = end;
+
+        CStringView {
+            offset: (string_pool_offset + start) as u32,
+            len: s.len() as u32,
+        }
+    };
+
+    //
+    // Column headers
+    //
+    for (i, name) in results.columns().iter().enumerate() {
+        col_slice[i] =
+            write_string(name, string_pool, &mut string_cursor);
+    }
+
+    //
+    // Cells + row views
+    //
+    for (row_idx, row) in results.rows().iter().enumerate() {
+        let first_cell_idx = row_idx * col_cnt;
+
+        for (col_idx, value) in row.values().iter().enumerate() {
+            let text = value_to_text(value);
+
+            cell_slice[first_cell_idx + col_idx] =
+                write_string(&text, string_pool, &mut string_cursor);
+        }
+
+        let row_cells_offset =
+            cells_offset +
+            first_cell_idx * size_of::<CStringView>();
+
+        row_slice[row_idx] = CRowView {
+            cells_offset: row_cells_offset as u32,
+        };
+    }
+
+    //
+    // Root header
+    //
+    root_slice[0] = CQueryResultLayout {
+        columns_offset: cols_offset as u32,
+        rows_offset: rows_offset as u32,
+        column_count: col_cnt as u32,
+        row_count: row_cnt as u32,
+        rows_affected: results.rows_affected(),
+    };
+
+    string_pool_offset + string_cursor
 }
 
 fn make_session<B>(backend: B) -> LixSession
@@ -280,7 +473,6 @@ pub extern "C" fn get_active_branch(
     let Some(session) = (unsafe { ptr.as_mut() }) else {
         return 0;
     };
-
     return session.inner.get_active_branch(out_buf, buf_len);
 }
 
@@ -316,4 +508,13 @@ pub extern "C" fn switch_branch(
     };
 
     return session.inner.change_branch(branch_id_ptr, branch_id_len);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn execute(ptr: *mut LixSession, sql_ptr: *const u8, sql_len: usize,
+    out_buf: *mut u8, buf_len: usize) -> usize {
+    let Some(session) = (unsafe { ptr.as_mut() }) else {
+        return 0;
+    };
+    return session.inner.execute(sql_ptr,sql_len, out_buf, buf_len);
 }
